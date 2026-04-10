@@ -790,13 +790,14 @@ class GenericComputerInterface(BaseComputerInterface):
     async def _keep_alive(self):
         """Keep the WebSocket connection alive with automatic reconnection."""
         retry_count = 0
+        max_retries = 200  # Give up after 200 consecutive failed attempts (~10 min with backoff)
         max_log_attempts = 1  # Only log the first attempt at INFO level
         log_interval = 500  # Then log every 500th attempt (significantly increased from 30)
         last_warning_time = 0
         min_warning_interval = 30  # Minimum seconds between connection lost warnings
         min_retry_delay = 0.5  # Minimum delay between connection attempts (500ms)
 
-        while not self._closed:
+        while not self._closed and retry_count < max_retries:
             try:
                 if self._ws is None or (
                     self._ws and self._ws.state == websockets.protocol.State.CLOSED
@@ -842,7 +843,7 @@ class GenericComputerInterface(BaseComputerInterface):
                                 "command": "authenticate",
                                 "params": {"api_key": self.api_key, "container_name": self.vm_name},
                             }
-                            await self._ws.send(json.dumps(auth_message))
+                            await asyncio.wait_for(self._ws.send(json.dumps(auth_message)), timeout=10)
 
                             # Wait for authentication response
                             async with self._recv_lock:
@@ -859,6 +860,7 @@ class GenericComputerInterface(BaseComputerInterface):
                             self.logger.info("Authentication successful")
 
                         self._reconnect_delay = 1  # Reset reconnect delay on successful connection
+                        retry_count = 0  # Reset retry count on success (only track consecutive failures)
                         self._last_ping = time.time()
                         retry_count = 0  # Reset retry count on successful connection
                     except (asyncio.TimeoutError, websockets.exceptions.WebSocketException) as e:
@@ -931,6 +933,15 @@ class GenericComputerInterface(BaseComputerInterface):
                         pass
                 self._ws = None
 
+        # If we exited because max retries reached (not because _closed was set),
+        # log and mark as closed to prevent further operations.
+        if not self._closed and retry_count >= max_retries:
+            self.logger.error(
+                f"WebSocket reconnection gave up after {retry_count} attempts. "
+                "Container may be unresponsive."
+            )
+            self._closed = True
+
     async def _ensure_connection(self):
         """Ensure WebSocket connection is established."""
         if self._reconnect_task is None or self._reconnect_task.done():
@@ -974,7 +985,7 @@ class GenericComputerInterface(BaseComputerInterface):
                     raise ConnectionError("WebSocket connection is not established")
 
                 message = {"command": command, "params": params or {}}
-                await self._ws.send(json.dumps(message))
+                await asyncio.wait_for(self._ws.send(json.dumps(message)), timeout=10)
                 async with self._recv_lock:
                     response = await asyncio.wait_for(self._ws.recv(), timeout=120)
                 self.logger.debug(f"Completed command: {command}")
@@ -1014,8 +1025,13 @@ class GenericComputerInterface(BaseComputerInterface):
             if self.vm_name:
                 headers["X-Container-Name"] = self.vm_name
 
-            # Send the request
-            async with aiohttp.ClientSession() as session:
+            # Send the request. Use a 120s total timeout (default aiohttp is 300s).
+            # Most commands (screenshot, click) return in <5s, but run_command()
+            # and large file I/O can legitimately take longer. The 5s connect
+            # timeout ensures dead containers fail fast while the generous total
+            # accommodates slow-but-alive operations.
+            timeout = aiohttp.ClientTimeout(total=120, connect=5)
+            async with aiohttp.ClientSession(timeout=timeout) as session:
                 async with session.post(self.rest_uri, json=payload, headers=headers) as response:
                     # Get the response text
                     response_text = await response.text()
@@ -1219,22 +1235,16 @@ class GenericComputerInterface(BaseComputerInterface):
             self._log_connection_attempts = False
 
     def close(self):
-        """Close WebSocket connection.
-
-        Note: In host computer server mode, we leave the connection open
-        to allow other clients to connect to the same server. The server
-        will handle cleaning up idle connections.
-        """
-        # Only cancel the reconnect task
+        """Close WebSocket connection and stop reconnection attempts."""
+        self._closed = True
         if self._reconnect_task:
             self._reconnect_task.cancel()
-
-        # Don't set closed flag or close websocket by default
-        # This allows the server to stay connected for other clients
-        # self._closed = True
-        # if self._ws:
-        #     asyncio.create_task(self._ws.close())
-        #     self._ws = None
+        if self._ws:
+            try:
+                asyncio.create_task(self._ws.close())
+            except RuntimeError:
+                pass  # No event loop running
+            self._ws = None
 
     def force_close(self):
         """Force close the WebSocket connection.

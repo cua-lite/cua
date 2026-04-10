@@ -165,7 +165,7 @@ class DockerProvider(BaseVMProvider):
         try:
             # Check if container exists and get its status
             cmd = ["docker", "inspect", name]
-            result = subprocess.run(cmd, capture_output=True, text=True)
+            result = await asyncio.to_thread(subprocess.run, cmd, capture_output=True, text=True)
 
             if result.returncode != 0:
                 # Container doesn't exist
@@ -237,7 +237,7 @@ class DockerProvider(BaseVMProvider):
         try:
             # List all containers (running and stopped) with the Cua image
             cmd = ["docker", "ps", "-a", "--filter", f"ancestor={self.image}", "--format", "json"]
-            result = subprocess.run(cmd, capture_output=True, text=True, check=True)
+            result = await asyncio.to_thread(subprocess.run, cmd, capture_output=True, text=True, check=True)
 
             containers = []
             if result.stdout.strip():
@@ -287,12 +287,12 @@ class DockerProvider(BaseVMProvider):
                     # Delete existing container
                     logger.info(f"Deleting existing container {name}")
                     delete_cmd = ["docker", "rm", name]
-                    result = subprocess.run(delete_cmd, capture_output=True, text=True, check=True)
+                    result = await asyncio.to_thread(subprocess.run, delete_cmd, capture_output=True, text=True, check=True)
                 else:
                     # Start existing container
                     logger.info(f"Starting existing container {name}")
                     start_cmd = ["docker", "start", name]
-                    result = subprocess.run(start_cmd, capture_output=True, text=True, check=True)
+                    result = await asyncio.to_thread(subprocess.run, start_cmd, capture_output=True, text=True, check=True)
 
                     # Wait for container to be ready
                     await self._wait_for_container_ready(name)
@@ -409,7 +409,7 @@ class DockerProvider(BaseVMProvider):
             logger.info(f"Running Docker container with command: {' '.join(cmd)}")
 
             # Run the container
-            result = subprocess.run(cmd, capture_output=True, text=True, check=True)
+            result = await asyncio.to_thread(subprocess.run, cmd, capture_output=True, text=True, check=True)
             container_id = result.stdout.strip()
 
             logger.info(f"Container {name} started with ID: {container_id[:12]}")
@@ -474,9 +474,11 @@ class DockerProvider(BaseVMProvider):
         try:
             logger.info(f"Stopping container {name}")
 
-            # Stop the container
+            # Stop the container (async to avoid blocking the event loop)
             cmd = ["docker", "stop", name]
-            result = subprocess.run(cmd, capture_output=True, text=True, check=True)
+            result = await asyncio.to_thread(
+                subprocess.run, cmd, capture_output=True, text=True, check=True
+            )
 
             # Remove from running containers tracking
             if name in self._running_containers:
@@ -487,7 +489,9 @@ class DockerProvider(BaseVMProvider):
             # Delete container if ephemeral=True
             if self.ephemeral:
                 cmd = ["docker", "rm", name]
-                result = subprocess.run(cmd, capture_output=True, text=True, check=True)
+                result = await asyncio.to_thread(
+                    subprocess.run, cmd, capture_output=True, text=True, check=True
+                )
 
             return {
                 "name": name,

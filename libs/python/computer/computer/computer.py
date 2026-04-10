@@ -557,6 +557,11 @@ class Computer:
                             storage=storage_param,
                         )
                         self.logger.info(f"VM run response: {response if response else 'None'}")
+
+                        # Fail fast if provider reported an error (e.g. port conflict)
+                        # instead of waiting 120s for wait_for_ready to time out.
+                        if response and response.get("status") == "error":
+                            raise RuntimeError(response.get("error", "VM run failed"))
                     except Exception as run_error:
                         self.logger.error(f"Failed to run VM: {run_error}")
                         raise RuntimeError(f"Failed to start VM: {run_error}")

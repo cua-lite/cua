@@ -45,6 +45,7 @@ class GenericComputerInterface(BaseComputerInterface):
         self._log_connection_attempts = True  # Flag to control connection attempt logging
         self._authenticated = False  # Track authentication status
         self._recv_lock = asyncio.Lock()  # Lock to ensure only one recv at a time
+        self._rest_session: Optional[aiohttp.ClientSession] = None  # Reuse across REST calls
 
         # Set logger name for the interface
         self.logger = Logger(logger_name, LogLevel.NORMAL)
@@ -1010,6 +1011,13 @@ class GenericComputerInterface(BaseComputerInterface):
 
         raise last_error if last_error else RuntimeError("Failed to send command")
 
+    def _get_rest_session(self) -> aiohttp.ClientSession:
+        """Return a reusable aiohttp session (lazy-created, one per interface)."""
+        if self._rest_session is None or self._rest_session.closed:
+            timeout = aiohttp.ClientTimeout(total=120, connect=5)
+            self._rest_session = aiohttp.ClientSession(timeout=timeout)
+        return self._rest_session
+
     async def _send_command_rest(
         self, command: str, params: Optional[Dict] = None
     ) -> Dict[str, Any]:
@@ -1025,39 +1033,38 @@ class GenericComputerInterface(BaseComputerInterface):
             if self.vm_name:
                 headers["X-Container-Name"] = self.vm_name
 
-            # Send the request. Use a 120s total timeout (default aiohttp is 300s).
-            # Most commands (screenshot, click) return in <5s, but run_command()
-            # and large file I/O can legitimately take longer. The 5s connect
-            # timeout ensures dead containers fail fast while the generous total
-            # accommodates slow-but-alive operations.
-            timeout = aiohttp.ClientTimeout(total=120, connect=5)
-            async with aiohttp.ClientSession(timeout=timeout) as session:
-                async with session.post(self.rest_uri, json=payload, headers=headers) as response:
-                    # Get the response text
-                    response_text = await response.text()
+            # Reuse a single session per interface instance to avoid fd exhaustion.
+            # Creating a new aiohttp.ClientSession per call opens a new TCP
+            # connection (and fd) each time. With 16+ concurrent containers,
+            # this leads to hundreds of simultaneous fds, which can trigger
+            # libuv epoll_ctl assertion failures and crash the process.
+            session = self._get_rest_session()
+            async with session.post(self.rest_uri, json=payload, headers=headers) as response:
+                # Get the response text
+                response_text = await response.text()
 
-                    # Trim whitespace
-                    response_text = response_text.strip()
+                # Trim whitespace
+                response_text = response_text.strip()
 
-                    # Check if it starts with "data: "
-                    if response_text.startswith("data: "):
-                        # Extract everything after "data: "
-                        json_str = response_text[6:]  # Remove "data: " prefix
-                        try:
-                            return json.loads(json_str)
-                        except json.JSONDecodeError:
-                            return {
-                                "success": False,
-                                "error": "Server returned malformed response",
-                                "message": response_text,
-                            }
-                    else:
-                        # Return error response
+                # Check if it starts with "data: "
+                if response_text.startswith("data: "):
+                    # Extract everything after "data: "
+                    json_str = response_text[6:]  # Remove "data: " prefix
+                    try:
+                        return json.loads(json_str)
+                    except json.JSONDecodeError:
                         return {
                             "success": False,
                             "error": "Server returned malformed response",
                             "message": response_text,
                         }
+                else:
+                    # Return error response
+                    return {
+                        "success": False,
+                        "error": "Server returned malformed response",
+                        "message": response_text,
+                    }
 
         except Exception as e:
             return {"success": False, "error": "Request failed", "message": str(e)}
@@ -1235,7 +1242,7 @@ class GenericComputerInterface(BaseComputerInterface):
             self._log_connection_attempts = False
 
     def close(self):
-        """Close WebSocket connection and stop reconnection attempts."""
+        """Close WebSocket connection, REST session, and stop reconnection attempts."""
         self._closed = True
         if self._reconnect_task:
             self._reconnect_task.cancel()
@@ -1245,6 +1252,12 @@ class GenericComputerInterface(BaseComputerInterface):
             except RuntimeError:
                 pass  # No event loop running
             self._ws = None
+        if self._rest_session and not self._rest_session.closed:
+            try:
+                asyncio.create_task(self._rest_session.close())
+            except RuntimeError:
+                pass  # No event loop running
+            self._rest_session = None
 
     def force_close(self):
         """Force close the WebSocket connection.
